@@ -1,6 +1,6 @@
 # aw510m-config
 
-aw510m-config provides a simple way to configure a HID keyboard-like device by sending binary packets directly through a Linux **hidraw** interface. It reads a configuration file, interprets defined key mappings or color settings, and transmits the corresponding HID packets to the device.
+aw510m-config provides a simple way to configure a HID mouse device by sending binary packets directly through a Linux **hidraw** interface. It reads a configuration file, interprets defined key mappings or color settings, and transmits the corresponding HID packets to the device.
 
 ## Overview
 
