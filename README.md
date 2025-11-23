@@ -76,7 +76,8 @@ All packets sent to the device:
 # Up Button
 key06=PageUp
 
-# Down Button\ nkey07=PageDown
+# Down Button
+key07=PageDown
 
 # Bottom Button
 key08=Home
