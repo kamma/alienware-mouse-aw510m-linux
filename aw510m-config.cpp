@@ -10,8 +10,15 @@
 #include <map>
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <cerrno>
+#include <dirent.h>
 
 using namespace std;
+
+// --- Alienware AW510M USB identity (Primax Electronics) ---
+static const uint16_t AW510M_VENDOR = 0x0461;
+static const uint16_t AW510M_PRODUCT = 0x4E9E;
 
 // --- Key map ---
 static const std::map<std::string, uint8_t> KEY_MAP = {
@@ -156,11 +163,146 @@ void sendPacket(int fd, const vector<uint8_t>& packet) {
     if (written < 0) cerr << "Error writing packet" << endl;
 }
 
+// --- HIDRAW autodetection ---
+struct HidDevice {
+    string node;      // /dev/hidrawN
+    string sysDir;    // /sys/class/hidraw/hidrawN/device
+    uint16_t vendor;
+    uint16_t product;
+    string name;
+};
+
+// Read vendor, product and name out of a hidraw device's uevent
+bool readHidInfo(HidDevice& dev) {
+    ifstream uevent(dev.sysDir + "/uevent");
+    if (!uevent.is_open()) return false;
+
+    bool hasId = false;
+    string line;
+    while (getline(uevent, line)) {
+        // HID_ID=<bus>:<vendor>:<product>
+        if (line.rfind("HID_ID=", 0) == 0) {
+            size_t first = line.find(':', 7);
+            size_t second = (first == string::npos) ? string::npos : line.find(':', first + 1);
+            if (second == string::npos) return false;
+            try {
+                dev.vendor = static_cast<uint16_t>(stoul(line.substr(first + 1, second - first - 1), nullptr, 16));
+                dev.product = static_cast<uint16_t>(stoul(line.substr(second + 1), nullptr, 16));
+            } catch (...) {
+                return false;
+            }
+            hasId = true;
+        } else if (line.rfind("HID_NAME=", 0) == 0) {
+            dev.name = line.substr(9);
+        }
+    }
+    return hasId;
+}
+
+// The config interface is the vendor collection (usage page 0xFF00) that accepts
+// output reports; the mouse and keyboard collections expose input reports only.
+// Items must be walked by size, not scanned for 0x91: the keyboard descriptor holds
+// 0x91 as Logical Max data and would otherwise look like an output report.
+bool hasOutputReport(const string& sysDir) {
+    ifstream f(sysDir + "/report_descriptor", ios::binary);
+    if (!f.is_open()) return false;
+
+    vector<uint8_t> desc((istreambuf_iterator<char>(f)), istreambuf_iterator<char>());
+
+    size_t i = 0;
+    while (i < desc.size()) {
+        uint8_t item = desc[i];
+
+        // Long item (bTag 0xF with size code 3): 16-bit payload length follows
+        if ((item & 0x0F) == 0x0F && (item & 0x03) == 0x03) {
+            if (i + 2 >= desc.size()) break;
+            i += 3 + (desc[i + 1] | (desc[i + 2] << 8));
+            continue;
+        }
+
+        // Short item: bits 1-0 size code (3 means 4 bytes), bits 3-2 type, bits 7-4 tag
+        size_t len = ((item & 0x03) == 0x03) ? 4 : (item & 0x03);
+        bool mainItem = ((item >> 2) & 0x3) == 0;
+        bool isOutput = (item >> 4) == 0x9;
+        bool isData = len >= 1 && i + 1 < desc.size() && (desc[i + 1] & 0x01) == 0;
+
+        if (mainItem && isOutput && isData) return true;
+
+        i += 1 + len;
+    }
+    return false;
+}
+
+// Every hidraw node currently bound in the system, in node order
+vector<HidDevice> listHidDevices() {
+    vector<HidDevice> devices;
+
+    DIR* dir = opendir("/sys/class/hidraw");
+    if (!dir) return devices;
+
+    while (dirent* entry = readdir(dir)) {
+        if (strncmp(entry->d_name, "hidraw", 6) != 0) continue;
+
+        HidDevice dev;
+        dev.node = string("/dev/") + entry->d_name;
+        dev.sysDir = string("/sys/class/hidraw/") + entry->d_name + "/device";
+        dev.vendor = 0;
+        dev.product = 0;
+        if (readHidInfo(dev)) devices.push_back(dev);
+    }
+    closedir(dir);
+
+    sort(devices.begin(), devices.end(),
+         [](const HidDevice& a, const HidDevice& b) { return a.node < b.node; });
+    return devices;
+}
+
+string hidIdString(const HidDevice& dev) {
+    ostringstream ss;
+    ss << hex << setw(4) << setfill('0') << dev.vendor << ":" << setw(4) << setfill('0') << dev.product;
+    return ss.str();
+}
+
+// Resolve the device to talk to: the given path, or the AW510M vendor interface
+string resolveDevicePath(const string& explicitPath, const char* progName) {
+    if (!explicitPath.empty()) return explicitPath;
+
+    vector<HidDevice> all = listHidDevices();
+
+    vector<HidDevice> matches;
+    for (const HidDevice& dev : all) {
+        if (dev.vendor == AW510M_VENDOR && dev.product == AW510M_PRODUCT && hasOutputReport(dev.sysDir))
+            matches.push_back(dev);
+    }
+
+    if (matches.empty()) {
+        cerr << "No Alienware AW510M vendor interface found in /dev." << endl;
+        if (!all.empty()) {
+            cerr << "HIDRAW devices present:" << endl;
+            for (const HidDevice& dev : all)
+                cerr << "  " << dev.node << "  " << hidIdString(dev) << "  " << dev.name << endl;
+        }
+        cerr << "Pass the device explicitly: " << progName << " <config_file> /dev/hidrawN" << endl;
+        return "";
+    }
+
+    if (matches.size() > 1)
+        cerr << "Multiple AW510M vendor interfaces, using " << matches.front().node << endl;
+    else
+        cerr << "Auto-detected " << matches.front().node << " (" << matches.front().name << ")" << endl;
+
+    return matches.front().node;
+}
+
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        cerr << "Usage: " << argv[0] << " <config_file> <hidraw_path>" << endl;
+    if (argc < 2 || argc > 3) {
+        cerr << "Usage: " << argv[0] << " <config_file> [hidraw_path]" << endl;
+        cerr << "Without hidraw_path the AW510M interface is autodetected." << endl;
         return 1;
     }
+
+    string devicePath = resolveDevicePath(argc == 3 ? argv[2] : "", argv[0]);
+    if (devicePath.empty()) return 1;
 
     ifstream config(argv[1]);
     if (!config.is_open()) {
@@ -168,9 +310,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    int fd = open(argv[2], O_WRONLY);
+    int fd = open(devicePath.c_str(), O_WRONLY);
     if (fd < 0) {
-        cerr << "Unable to open HIDRAW device" << endl;
+        cerr << "Unable to open " << devicePath << ": " << strerror(errno) << endl;
         return 1;
     }
 
